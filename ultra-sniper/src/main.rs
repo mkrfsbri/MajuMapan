@@ -126,11 +126,25 @@ fn main() {
         }
 
         // ── Paper trade feed ──────────────────────────────────────────────────
-        let _closed = paper.feed(*candle);
+        let closed = paper.feed(*candle);
+
+        // Print each closed trade as it happens
+        for t in &closed {
+            println!(
+                "[trade #{:>3}] {:?} | entry={:.2} exit={:.2} | pnl={:+.2} ({:+.1}%) | {:?} after {} bars",
+                t.id,
+                t.side,
+                t.entry_price,
+                t.exit_price,
+                t.pnl,
+                t.pnl_pct * 100.0,
+                t.exit_reason,
+                t.bars_held,
+            );
+        }
     }
 
     // ── Final summary (paper trader) ─────────────────────────────────────────
-    let stats = paper.stats();
-    let _ = stats; // available for inspection; no output per project convention
+    println!("{}", paper.stats().display());
 }
 

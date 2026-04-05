@@ -124,6 +124,37 @@ pub struct PaperStats {
     pub open_trades:   usize,
 }
 
+impl PaperStats {
+    /// Returns a formatted multi-line summary string.
+    pub fn display(&self) -> String {
+        let pf = if self.profit_factor == f64::INFINITY {
+            "∞".to_string()
+        } else {
+            format!("{:.2}", self.profit_factor)
+        };
+        format!(
+            "┌─ Paper Trade Summary ───────────────────\n\
+             │  Balance      : ${:.2}\n\
+             │  Net PnL      : ${:+.2}\n\
+             │  Trades       : {}  (W:{} / L:{})\n\
+             │  Win Rate     : {:.1}%\n\
+             │  Profit Factor: {}\n\
+             │  Max Drawdown : ${:.2}\n\
+             │  Open         : {}\n\
+             └─────────────────────────────────────────",
+            self.balance,
+            self.net_pnl,
+            self.total_trades,
+            self.wins,
+            self.losses,
+            self.winrate * 100.0,
+            pf,
+            self.max_drawdown,
+            self.open_trades,
+        )
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Paper Trader
 // ─────────────────────────────────────────────────────────────────────────────
