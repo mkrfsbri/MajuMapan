@@ -1,0 +1,14 @@
+[package]
+name = "ultra_sniper"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ultra_sniper"
+path = "src/main.rs"
+
+[lib]
+name = "ultra_sniper"
+path = "src/lib.rs"
+
+[dependencies]
