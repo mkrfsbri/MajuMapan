@@ -9,3 +9,4 @@ pub mod allocator;
 pub mod portfolio;
 pub mod risk;
 pub mod execution;
+pub mod paper_trade;
