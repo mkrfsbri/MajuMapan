@@ -1,5 +1,7 @@
 use ultra_sniper::{
     data::{Candle, Aggregator, Timeframe},
+    feed::{BinanceFeed, PolymarketFeed, CandleFeed, MarketFeed},
+    feed::binance::Interval,
     features::{Ema, Rsi, Atr, IndicatorState},
     strategy::{Signal, evaluate as strategy_eval},
     regime::{classify, RegimeInput},
@@ -12,20 +14,48 @@ use ultra_sniper::{
     paper_trade::{PaperTrader, PaperConfig},
 };
 
-fn main() {
-    // ── 1. Mock BTC 1m candle data ────────────────────────────────────────────
-    let prices: &[f64] = &[
-        29_500.0, 29_550.0, 29_600.0, 29_480.0, 29_700.0,
-        29_750.0, 29_800.0, 29_650.0, 29_900.0, 30_000.0,
-        29_950.0, 29_800.0, 29_700.0, 29_600.0, 29_500.0,
-        29_400.0, 29_450.0, 29_600.0, 29_750.0, 30_000.0,
-        30_050.0, 30_100.0, 30_200.0, 30_150.0, 30_300.0,
-    ];
+// Polymarket condition ID for "BTC above X by date" — replace with real ID
+const POLY_CONDITION_ID: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
-    // ── 2. Build candles ──────────────────────────────────────────────────────
-    let candles: Vec<Candle> = prices.iter().enumerate().map(|(i, &p)| {
-        Candle::new(p, p + 30.0, p - 30.0, p + 5.0, i as u64 * 60)
-    }).collect();
+fn main() {
+    // ── 1. Fetch candles from Binance (fallback to mock if offline) ───────────
+    let binance = BinanceFeed::new("BTCUSDT", Interval::M1);
+    let candles: Vec<Candle> = match binance.fetch_candles(100) {
+        Ok(c) => {
+            println!("[binance] fetched {} candles (BTCUSDT 1m)", c.len());
+            c
+        }
+        Err(e) => {
+            println!("[binance] offline — using mock data ({e})");
+            let prices: &[f64] = &[
+                29_500.0, 29_550.0, 29_600.0, 29_480.0, 29_700.0,
+                29_750.0, 29_800.0, 29_650.0, 29_900.0, 30_000.0,
+                29_950.0, 29_800.0, 29_700.0, 29_600.0, 29_500.0,
+                29_400.0, 29_450.0, 29_600.0, 29_750.0, 30_000.0,
+                30_050.0, 30_100.0, 30_200.0, 30_150.0, 30_300.0,
+            ];
+            prices.iter().enumerate()
+                .map(|(i, &p)| Candle::new(p, p + 30.0, p - 30.0, p + 5.0, i as u64 * 60))
+                .collect()
+        }
+    };
+
+    // ── 2. Fetch Polymarket YES price (fallback to 0.5 if offline) ───────────
+    let poly = PolymarketFeed::new();
+    let market_price: f64 = match poly.fetch_price(POLY_CONDITION_ID) {
+        Ok(mp) if mp.active => {
+            println!("[polymarket] YES={:.3}  NO={:.3}  vol=${:.0}", mp.yes_price, mp.no_price, mp.volume);
+            mp.yes_price
+        }
+        Ok(_) => {
+            println!("[polymarket] market inactive — using 0.50");
+            0.5
+        }
+        Err(e) => {
+            println!("[polymarket] offline — using 0.50 ({e})");
+            0.5
+        }
+    };
 
     // ── 3. Compute features ───────────────────────────────────────────────────
     let mut ema9  = Ema::new(9);
@@ -92,7 +122,7 @@ fn main() {
             ModelOutput::new(rsi_score, 0.5),
         ];
         let p_win     = ensemble(&models);
-        let ev_result = ev_compute(p_win, 0.5);
+        let ev_result = ev_compute(p_win, market_price);
 
         let decision = decide(&BrainInput {
             signal,
@@ -116,7 +146,7 @@ fn main() {
 
         if !blocked && decision == Decision::Trade && signal != Signal::None {
             if let Some(alloc) = allocs.first() {
-                if let Some(id) = executor.open(signal, 0.5, alloc.amount) {
+                if let Some(id) = executor.open(signal, market_price, alloc.amount) {
                     let resolution = if signal == Signal::Down { 0.3 } else { 0.7 };
                     if let Some(pnl) = executor.close(id, resolution) {
                         returns.push(pnl);

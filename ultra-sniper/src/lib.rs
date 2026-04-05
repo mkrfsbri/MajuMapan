@@ -1,4 +1,5 @@
 pub mod data;
+pub mod feed;
 pub mod features;
 pub mod strategy;
 pub mod regime;
