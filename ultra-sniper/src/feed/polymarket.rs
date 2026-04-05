@@ -1,8 +1,14 @@
 //! Polymarket Gamma API feed — fetches YES/NO prices and auto-discovers markets.
 //!
 //! Endpoints used:
-//!   GET /markets?conditionIds={id}        — price for known market
-//!   GET /markets?active=true&q={query}&limit={n}  — search / discovery
+//!   GET /markets?conditionIds={id}              — price for known market
+//!   GET /markets?active=true&q={query}&limit={n} — keyword search / discovery
+//!   GET /events?slug={slug}                      — discover market by event slug
+//!
+//! Slug-based discovery (preferred for BTC Up/Down markets):
+//!   URL pattern: https://polymarket.com/event/btc-updown-5m-{timestamp}
+//!   5m slug : "btc-updown-5m-{timestamp}"
+//!   15m slug: "btc-updown-15m-{timestamp}" (same timestamp, different interval)
 
 use super::{MarketFeed, FeedError};
 
@@ -63,6 +69,41 @@ pub struct TimeframePair {
 impl TimeframePair {
     pub fn is_complete(&self) -> bool {
         self.tf5m_id.is_some() && self.tf15m_id.is_some()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SlugPair — slug-based market identification
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A pair of Polymarket event slugs for 5m and 15m Up/Down markets.
+///
+/// Slugs follow the pattern `btc-updown-{interval}-{timestamp}`.
+/// Given the 5m slug, the 15m slug is derived by replacing `5m` with `15m`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlugPair {
+    pub slug_5m:  String,
+    pub slug_15m: String,
+}
+
+impl SlugPair {
+    /// Build a `SlugPair` from a 5m slug.
+    ///
+    /// The 15m slug is derived automatically: `"btc-updown-5m-{ts}"` → `"btc-updown-15m-{ts}"`.
+    pub fn from_5m_slug(slug_5m: &str) -> Self {
+        // Replace the first occurrence of "-5m-" with "-15m-".
+        let slug_15m = slug_5m.replacen("-5m-", "-15m-", 1);
+        Self { slug_5m: slug_5m.to_string(), slug_15m }
+    }
+
+    /// Build explicitly with both slugs.
+    pub fn new(slug_5m: impl Into<String>, slug_15m: impl Into<String>) -> Self {
+        Self { slug_5m: slug_5m.into(), slug_15m: slug_15m.into() }
+    }
+
+    /// Extract the Unix timestamp embedded in the slug (last `-`-delimited token).
+    pub fn timestamp_from_slug(slug: &str) -> Option<u64> {
+        slug.rsplit('-').next().and_then(|s| s.parse().ok())
     }
 }
 
@@ -224,6 +265,60 @@ impl PolymarketFeed {
         q.contains("btc") || q.contains("bitcoin")
     }
 
+    // ── Event / slug parser ───────────────────────────────────────────────────
+
+    /// Parse a Gamma `/events?slug=...` response into a list of [`DiscoveredMarket`].
+    ///
+    /// The response is an array of event objects, each containing a `markets` array.
+    /// All markets from all matching events are flattened into one list.
+    pub fn parse_event(raw: &str) -> Result<Vec<DiscoveredMarket>, FeedError> {
+        let arr: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|e| FeedError::Parse(e.to_string()))?;
+
+        let events = arr.as_array().ok_or(FeedError::Empty)?;
+        if events.is_empty() { return Err(FeedError::Empty); }
+
+        let mut markets = Vec::new();
+
+        for event in events {
+            // Each event has a "markets" array.
+            let mkt_arr = match event["markets"].as_array() {
+                Some(a) => a,
+                None    => continue,
+            };
+
+            for m in mkt_arr {
+                let condition_id = m["conditionId"].as_str().unwrap_or("").to_string();
+                if condition_id.is_empty() { continue; }
+
+                let question = m["question"].as_str().unwrap_or("").to_string();
+                let active   = m["active"].as_bool().unwrap_or(false);
+                let volume   = m["volume"].as_str()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .or_else(|| m["volume"].as_f64())
+                    .unwrap_or(0.0);
+
+                let (yes_price, no_price) = if let Some(prices) = m["outcomePrices"].as_array() {
+                    let y = prices.get(0).and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.5);
+                    let n = prices.get(1).and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.5);
+                    (y, n)
+                } else {
+                    (0.5, 0.5)
+                };
+
+                let end_ts = Self::parse_end_ts(m["endDate"].as_str().unwrap_or(""));
+
+                markets.push(DiscoveredMarket {
+                    condition_id, question, yes_price, no_price, volume, active, end_ts,
+                });
+            }
+        }
+
+        if markets.is_empty() { Err(FeedError::Empty) } else { Ok(markets) }
+    }
+
     // ── URL builders ──────────────────────────────────────────────────────────
 
     fn url(&self, condition_id: &str) -> String {
@@ -232,6 +327,10 @@ impl PolymarketFeed {
 
     fn discovery_url(&self, query: &str, limit: u32) -> String {
         format!("{}/markets?active=true&q={}&limit={}", self.base_url, query, limit)
+    }
+
+    fn event_url(&self, slug: &str) -> String {
+        format!("{}/events?slug={}", self.base_url, slug)
     }
 
     // ── public fetch methods ──────────────────────────────────────────────────
@@ -254,6 +353,48 @@ impl PolymarketFeed {
             return Err(FeedError::Parse("no active BTC markets found".into()));
         }
         Ok(pair)
+    }
+
+    /// Fetch markets for a single Polymarket event by its URL slug.
+    ///
+    /// Calls `GET /events?slug={slug}` and returns all markets within the event.
+    pub fn discover_by_slug(&self, slug: &str) -> Result<Vec<DiscoveredMarket>, FeedError> {
+        let url  = self.event_url(slug);
+        let body = reqwest::blocking::get(&url)
+            .map_err(|e| FeedError::Http(e.to_string()))?
+            .text()
+            .map_err(|e| FeedError::Http(e.to_string()))?;
+        Self::parse_event(&body)
+    }
+
+    /// Auto-discover Up/Down markets using a [`SlugPair`].
+    ///
+    /// Fetches both slugs and picks the highest-volume active market from each.
+    /// Falls back to the 5m conditionId for 15m if the 15m event is empty.
+    pub fn auto_select_updown(&self, slugs: &SlugPair) -> Result<TimeframePair, FeedError> {
+        let markets_5m  = self.discover_by_slug(&slugs.slug_5m)?;
+        let tf5m_id = Self::pick_best_active(&markets_5m)
+            .map(|m| m.condition_id.clone())
+            .ok_or_else(|| FeedError::Parse(format!("no active market in slug '{}'", slugs.slug_5m)))?;
+
+        let tf15m_id = self.discover_by_slug(&slugs.slug_15m)
+            .ok()
+            .and_then(|ms| {
+                Self::pick_best_active(&ms).map(|m| m.condition_id.clone())
+            })
+            .unwrap_or_else(|| tf5m_id.clone()); // fallback to 5m id
+
+        Ok(TimeframePair {
+            tf5m_id:  Some(tf5m_id),
+            tf15m_id: Some(tf15m_id),
+        })
+    }
+
+    /// Pick the single best (highest-volume, active) market from a slice.
+    fn pick_best_active(markets: &[DiscoveredMarket]) -> Option<&DiscoveredMarket> {
+        markets.iter()
+            .filter(|m| m.active)
+            .max_by(|a, b| a.volume.partial_cmp(&b.volume).unwrap_or(std::cmp::Ordering::Equal))
     }
 }
 
@@ -544,5 +685,184 @@ mod tests {
         let feed = PolymarketFeed::new();
         let url  = feed.discovery_url("bitcoin", 10);
         assert!(url.contains("bitcoin") && url.contains("limit=10") && url.contains("active=true"));
+    }
+
+    // ── SlugPair ──────────────────────────────────────────────────────────────
+
+    const SLUG_5M:  &str = "btc-updown-5m-1775409600";
+    const SLUG_15M: &str = "btc-updown-15m-1775409600";
+
+    #[test]
+    fn slug_pair_from_5m_derives_15m() {
+        let pair = SlugPair::from_5m_slug(SLUG_5M);
+        assert_eq!(pair.slug_5m,  SLUG_5M);
+        assert_eq!(pair.slug_15m, SLUG_15M);
+    }
+
+    #[test]
+    fn slug_pair_new_stores_both() {
+        let pair = SlugPair::new(SLUG_5M, SLUG_15M);
+        assert_eq!(pair.slug_5m,  SLUG_5M);
+        assert_eq!(pair.slug_15m, SLUG_15M);
+    }
+
+    #[test]
+    fn slug_pair_5m_unchanged_when_no_pattern() {
+        // If the slug has no "-5m-", slug_15m == slug_5m (no accidental mutation).
+        let pair = SlugPair::from_5m_slug("some-other-slug");
+        assert_eq!(pair.slug_5m, pair.slug_15m); // replacen returns original when not found
+    }
+
+    #[test]
+    fn slug_timestamp_extracted() {
+        let ts = SlugPair::timestamp_from_slug(SLUG_5M);
+        assert_eq!(ts, Some(1_775_409_600));
+    }
+
+    #[test]
+    fn slug_timestamp_missing_returns_none() {
+        assert!(SlugPair::timestamp_from_slug("no-number-here-abc").is_none());
+    }
+
+    // ── event URL builder ─────────────────────────────────────────────────────
+
+    #[test]
+    fn event_url_contains_slug() {
+        let feed = PolymarketFeed::new();
+        let url  = feed.event_url(SLUG_5M);
+        assert!(url.contains("/events?slug=") && url.contains(SLUG_5M));
+    }
+
+    // ── parse_event ───────────────────────────────────────────────────────────
+
+    const EVENT_SAMPLE: &str = r#"[
+      {
+        "id": "1001",
+        "slug": "btc-updown-5m-1775409600",
+        "title": "BTC Up/Down 5m",
+        "markets": [
+          {
+            "conditionId": "0xfeed5m001",
+            "question": "Will BTC be higher in 5 minutes?",
+            "outcomePrices": ["0.52", "0.48"],
+            "volume": "45000.00",
+            "active": true,
+            "endDate": "2026-04-05T12:05:00Z"
+          },
+          {
+            "conditionId": "0xfeed5m002",
+            "question": "Will BTC be higher in 5 minutes? (round 2)",
+            "outcomePrices": ["0.50", "0.50"],
+            "volume": "12000.00",
+            "active": false,
+            "endDate": "2026-04-05T12:10:00Z"
+          }
+        ]
+      }
+    ]"#;
+
+    const EVENT_15M_SAMPLE: &str = r#"[
+      {
+        "id": "1002",
+        "slug": "btc-updown-15m-1775409600",
+        "title": "BTC Up/Down 15m",
+        "markets": [
+          {
+            "conditionId": "0xfeed15m001",
+            "question": "Will BTC be higher in 15 minutes?",
+            "outcomePrices": ["0.53", "0.47"],
+            "volume": "30000.00",
+            "active": true,
+            "endDate": "2026-04-05T12:15:00Z"
+          }
+        ]
+      }
+    ]"#;
+
+    #[test]
+    fn parse_event_returns_markets() {
+        let markets = PolymarketFeed::parse_event(EVENT_SAMPLE).unwrap();
+        assert_eq!(markets.len(), 2);
+    }
+
+    #[test]
+    fn parse_event_condition_id_correct() {
+        let markets = PolymarketFeed::parse_event(EVENT_SAMPLE).unwrap();
+        assert_eq!(markets[0].condition_id, "0xfeed5m001");
+    }
+
+    #[test]
+    fn parse_event_question_correct() {
+        let markets = PolymarketFeed::parse_event(EVENT_SAMPLE).unwrap();
+        assert!(markets[0].question.contains("BTC"));
+    }
+
+    #[test]
+    fn parse_event_prices_parsed() {
+        let markets = PolymarketFeed::parse_event(EVENT_SAMPLE).unwrap();
+        assert!((markets[0].yes_price - 0.52).abs() < 1e-9);
+        assert!((markets[0].no_price  - 0.48).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_event_active_flag_preserved() {
+        let markets = PolymarketFeed::parse_event(EVENT_SAMPLE).unwrap();
+        assert!(markets[0].active);
+        assert!(!markets[1].active);
+    }
+
+    #[test]
+    fn parse_event_volume_correct() {
+        let markets = PolymarketFeed::parse_event(EVENT_SAMPLE).unwrap();
+        assert!((markets[0].volume - 45_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn parse_event_empty_array_returns_error() {
+        assert!(matches!(PolymarketFeed::parse_event("[]"), Err(FeedError::Empty)));
+    }
+
+    #[test]
+    fn parse_event_invalid_json_returns_error() {
+        assert!(matches!(PolymarketFeed::parse_event("{bad}"), Err(FeedError::Parse(_))));
+    }
+
+    #[test]
+    fn parse_event_no_markets_in_event_returns_error() {
+        let raw = r#"[{"id":"1","slug":"x","markets":[]}]"#;
+        assert!(matches!(PolymarketFeed::parse_event(raw), Err(FeedError::Empty)));
+    }
+
+    // ── pick_best_active ──────────────────────────────────────────────────────
+
+    #[test]
+    fn pick_best_active_returns_highest_volume_active() {
+        let markets = PolymarketFeed::parse_event(EVENT_SAMPLE).unwrap();
+        // market[0] active vol=45k, market[1] inactive vol=12k → best = market[0]
+        let best = PolymarketFeed::pick_best_active(&markets).unwrap();
+        assert_eq!(best.condition_id, "0xfeed5m001");
+    }
+
+    #[test]
+    fn pick_best_active_skips_inactive() {
+        let markets = vec![DiscoveredMarket {
+            condition_id: "0xinactive".into(), question: "x".into(),
+            yes_price: 0.5, no_price: 0.5, volume: 999_999.0,
+            active: false, end_ts: 0,
+        }];
+        assert!(PolymarketFeed::pick_best_active(&markets).is_none());
+    }
+
+    // ── auto_select_updown (parse path only, no network) ─────────────────────
+
+    #[test]
+    fn slugpair_from_example_url_slug() {
+        // Simulates extracting the slug from:
+        // https://polymarket.com/event/btc-updown-5m-1775409600
+        let slug_from_url = "btc-updown-5m-1775409600";
+        let pair = SlugPair::from_5m_slug(slug_from_url);
+        assert_eq!(pair.slug_5m,  "btc-updown-5m-1775409600");
+        assert_eq!(pair.slug_15m, "btc-updown-15m-1775409600");
+        assert_eq!(SlugPair::timestamp_from_slug(&pair.slug_5m), Some(1_775_409_600));
     }
 }
