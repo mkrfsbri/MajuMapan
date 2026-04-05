@@ -12,3 +12,4 @@ pub mod risk;
 pub mod execution;
 pub mod paper_trade;
 pub mod runner;
+pub mod simulation;
